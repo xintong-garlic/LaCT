@@ -388,7 +388,7 @@ class CausalLaCTSwiGLUWithSlidingWindowAttn(torch.nn.Module):
         # better to have float32 for lr.
         # For muon, I found that float16 is still very good.
         with torch.autocast(device_type="cuda", enabled=False):
-            lr = self.lr_proj(x)  # [b, l, lr_dim]
+            lr = self.lr_proj(x.to(self.lr_proj.weight.dtype))  # [b, l, lr_dim]
 
         lr = torch.nn.functional.softplus(lr.float() + self.base_lr_inv)
 
