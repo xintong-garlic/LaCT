@@ -6,13 +6,8 @@ import torch.cuda.amp as amp
 from einops import rearrange
 
 try:
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
-    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
+    from flash_attn import flash_attn_func
 except ImportError:
-    warnings.warn(
-        "Flash Attention is not installed. Please install it via `pip install flash-attn --no-build-isolation`",
-        category=ImportWarning
-    )
     flash_attn_func = None
 
 
@@ -94,10 +89,13 @@ def block_causal_lact_swiglu(
     momentum: torch.Tensor = None, # [b, s, 1] # none means no momentum
     use_muon: bool = True,
     chunk_size: int=2048,  # test-time training chunk size
+    apply_after_update: bool = False,
 ) -> torch.Tensor:
     """
     Block causal LaCT with SwiGLU fast weight function.
-        Apply then Update => Shifted Block Causal LaCT
+        By default, apply then update (shifted block causal LaCT).
+        With apply_after_update=True, update then apply every chunk, including
+        the final partial chunk. Queries may depend on their entire chunk.
     w0, w1, w2 are the fast weights. f(x) =  w1 @ (silu(w0 @ x) * (w2 @ x))
     
     About precision:
@@ -108,6 +106,9 @@ def block_causal_lact_swiglu(
         The final output are bf16.
     """
     
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+
     # adding detach here sometimes improves stability.
     w0_norm = w0.norm(dim=2, keepdim=True)
     w1_norm = w1.norm(dim=2, keepdim=True)
@@ -125,9 +126,11 @@ def block_causal_lact_swiglu(
 
     e_index = 0
     seq_len = k.shape[1]
-    for i in range(0, seq_len - chunk_size, chunk_size):
+    # Preserve the legacy final-tail behavior when applying before updating.
+    update_stop = seq_len if apply_after_update else seq_len - chunk_size
+    for i in range(0, update_stop, chunk_size):
         s_index = i
-        e_index = s_index + chunk_size
+        e_index = min(s_index + chunk_size, seq_len)
 
         # [b, l, dk]
         ki = k[:, s_index:e_index, :]  # bf16
@@ -140,12 +143,13 @@ def block_causal_lact_swiglu(
         lr2i = lr2[:, s_index:e_index, :]  # [b, l, d/1] fp32
         lr0i = lr0[:, s_index:e_index, :]  # [b, l, d/1] fp32
 
-        ########## use previous fast weights to get the final output
-        # [b, dh, dk] @ [b, dk, l] -> [b, dh, l]
-        h = torch.bmm(w2, qi)
-        gate = F.silu(torch.bmm(w0, qi), inplace=True)
-        # [b, dv, dh] @ [b, dh, l] -> [b, dv, l] -> [b, l, dv]
-        output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
+        if not apply_after_update:
+            ########## use previous fast weights to get the final output
+            # [b, dh, dk] @ [b, dk, l] -> [b, dh, l]
+            h = torch.bmm(w2, qi)
+            gate = F.silu(torch.bmm(w0, qi), inplace=True)
+            # [b, dv, dh] @ [b, dh, l] -> [b, dv, l] -> [b, l, dv]
+            output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
 
         ########## compute the gradient and update the fast weights
         # [b, dh, dk] @ [b, dk, l] -> [b, dh, l]
@@ -197,16 +201,22 @@ def block_causal_lact_swiglu(
         w2 = w2 / (w2.norm(dim=2, keepdim=True) + 1e-5) * w2_norm
 
 
-    s_index = e_index # update_length - mini_batch_size
-    e_index = seq_len
+        if apply_after_update:
+            h = torch.bmm(w2, qi)
+            gate = F.silu(torch.bmm(w0, qi), inplace=True)
+            output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
 
-    qi = q[:, :, s_index:e_index]
-    # use the last w0 and w1 to get the final output
-    # [b, dh, dk] @ [b, dk, l] -> [b, dh, l]
-    h = torch.bmm(w2, qi)
-    gate = F.silu(torch.bmm(w0, qi), inplace=True)
-    # [b, dv, dh] @ [b, dh, l] -> [b, dv, l]
-    output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
+    if not apply_after_update:
+        s_index = e_index # update_length - mini_batch_size
+        e_index = seq_len
+
+        qi = q[:, :, s_index:e_index]
+        # use the last w0 and w1 to get the final output
+        # [b, dh, dk] @ [b, dk, l] -> [b, dh, l]
+        h = torch.bmm(w2, qi)
+        gate = F.silu(torch.bmm(w0, qi), inplace=True)
+        # [b, dv, dh] @ [b, dh, l] -> [b, dv, l]
+        output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
     # -> [b, l, dv]
     return output.transpose(1, 2)
 
@@ -221,9 +231,10 @@ def inv_softplus(x):
 
 class CausalLaCTSwiGLUWithSlidingWindowAttn(torch.nn.Module):
     """
-    Causal LaCT with SwiGLU fast weight function and sliding window attention. Suitable for ordered 1D sequence like language. 
-    The sliding window attention is computed by flash_attn_func.
-    The sliding window attention is mixed into the same layer as the LaCT with shared QKV, following the style of GAU(https://arxiv.org/abs/2202.10447).
+    Block-causal LaCT with optional sliding-window attention and chunk convolution.
+    SWA shares projected QKV with LaCT, following the GAU style. Chunk convolution
+    acts only on the LaCT branch, before SiLU and Q/K normalization. When
+    apply_after_update=True, queries depend on K/V throughout their own chunk.
 
     """
 
@@ -240,8 +251,38 @@ class CausalLaCTSwiGLUWithSlidingWindowAttn(torch.nn.Module):
         use_muon: bool = True,  # if your seq len > head_dim * 2, recommended to be True
         base_lr: float = 1e-2,
         ttt_scale_before_sum: bool = True,
+        use_swa: bool = True,
+        apply_after_update: bool = False,
+        chunk_shift_size: int = None,
+        conv_size: int = 2,
     ):
         super().__init__()
+        if head_dim <= 0 or dim % head_dim != 0:
+            raise ValueError("dim must be divisible by positive head_dim")
+        if lact_chunk_size <= 0:
+            raise ValueError("lact_chunk_size must be positive")
+        if use_swa:
+            if attn_head_dim <= 0 or dim % attn_head_dim != 0:
+                raise ValueError("dim must be divisible by positive attn_head_dim")
+            if window_size is not None and window_size < lact_chunk_size:
+                raise ValueError("window_size must be None or >= lact_chunk_size")
+            if flash_attn_func is None:
+                raise ImportError("FlashAttention is required when use_swa=True")
+        if chunk_shift_size is not None and (chunk_shift_size <= 0 or conv_size <= 0):
+            raise ValueError("chunk_shift_size and conv_size must be positive")
+        self.use_swa = use_swa
+        self.apply_after_update = apply_after_update
+        self.chunk_shift_size = chunk_shift_size
+        self.ttt_scale_before_sum = ttt_scale_before_sum
+        if chunk_shift_size is not None:
+            from fla.modules import ShortConvolution
+            from mim.ops.chunk_shift import chunk_shift
+
+            self._chunk_shift = chunk_shift
+            self.q_chunk_shift = ShortConvolution(dim, kernel_size=conv_size, bias=False, activation=None)
+            self.k_chunk_shift = ShortConvolution(dim, kernel_size=conv_size, bias=False, activation=None)
+            self.v_chunk_shift = ShortConvolution(dim, kernel_size=conv_size, bias=False, activation=None)
+
         self.dim = dim
         self.head_dim = head_dim
         self.inter_multi = inter_multi
@@ -253,7 +294,7 @@ class CausalLaCTSwiGLUWithSlidingWindowAttn(torch.nn.Module):
         self.head_dim = head_dim
         self.attn_head_dim = attn_head_dim
         self.num_ttt_heads = dim // head_dim
-        self.num_attn_heads = dim // attn_head_dim
+        self.num_attn_heads = dim // attn_head_dim if use_swa else None
 
         self.to_qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.o_proj = nn.Linear(dim, dim, bias=False)
@@ -291,8 +332,9 @@ class CausalLaCTSwiGLUWithSlidingWindowAttn(torch.nn.Module):
 
         
         # add scaling and offset for the shared QK vectors
-        self.qk_scale = nn.Parameter(torch.ones(dim, 2))
-        self.qk_offset = nn.Parameter(torch.zeros(dim, 2))
+        if use_swa:
+            self.qk_scale = nn.Parameter(torch.ones(dim, 2))
+            self.qk_offset = nn.Parameter(torch.zeros(dim, 2))
 
         if ttt_scale_before_sum:
             self.ttt_scale_proj = nn.Linear(dim, self.num_ttt_heads)
@@ -319,7 +361,20 @@ class CausalLaCTSwiGLUWithSlidingWindowAttn(torch.nn.Module):
         """
         # [b, l, d]
         attn_qkv = self.to_qkv(x)
-        ttt_qkv = F.silu(attn_qkv)
+        ttt_qkv = attn_qkv
+        if self.chunk_shift_size is not None:
+            # Stack instead of assigning into projection views to preserve autograd.
+            ttt_qkv = torch.cat([
+                torch.stack([
+                    self._chunk_shift(sample, conv, self.chunk_shift_size)
+                    for sample in projected
+                ])
+                for projected, conv in zip(
+                    attn_qkv.chunk(3, dim=-1),
+                    (self.q_chunk_shift, self.k_chunk_shift, self.v_chunk_shift),
+                )
+            ], dim=-1)
+        ttt_qkv = F.silu(ttt_qkv)
 
         ttt_q, ttt_k, ttt_v = rearrange(
             ttt_qkv,
@@ -355,15 +410,20 @@ class CausalLaCTSwiGLUWithSlidingWindowAttn(torch.nn.Module):
 
         # [b * num_heads, l, ttt_head_dim]
         ttt_output = block_causal_lact_swiglu(
-            w0, w1, w2, ttt_q, ttt_k, ttt_v, lr0, lr1, lr2, momentum, self.use_muon, chunk_size=self.lact_chunk_size
+            w0, w1, w2, ttt_q, ttt_k, ttt_v, lr0, lr1, lr2, momentum, self.use_muon, chunk_size=self.lact_chunk_size,
+            apply_after_update=self.apply_after_update,
         )
         ttt_output = self.o_norm(ttt_output)
-        ttt_scale_per_head = F.silu(self.ttt_scale_proj(x), inplace=False)
-        ttt_scale_per_head = rearrange(ttt_scale_per_head, 'b s (n_h d) -> (b n_h) s d', n_h=self.num_ttt_heads)
-        ttt_output = ttt_output * ttt_scale_per_head
+        if self.ttt_scale_before_sum:
+            ttt_scale_per_head = F.silu(self.ttt_scale_proj(x), inplace=False)
+            ttt_scale_per_head = rearrange(ttt_scale_per_head, 'b s (n_h d) -> (b n_h) s d', n_h=self.num_ttt_heads)
+            ttt_output = ttt_output * ttt_scale_per_head
         ttt_output = rearrange(
             ttt_output, "(b h) l d -> b l (h d)", h=self.num_ttt_heads, b=x.shape[0]
         )
+
+        if not self.use_swa:
+            return self.o_proj(ttt_output)
 
         #### Begin Sliding Window Attention ####
         # [b, l, d]
